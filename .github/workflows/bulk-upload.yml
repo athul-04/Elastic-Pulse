@@ -17,31 +17,36 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: "🚀 Initialize pipeline"
+      # 1. INITIALIZE
+      - name: "🚀 1/5 | Initialize Pipeline"
         run: |
           echo "========================================"
           echo "       ELASTIC PULSE PIPELINE"
           echo "          FULL BULK UPLOAD"
           echo "========================================"
+          echo "Mode: FULL LOAD"
           echo "Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "🚀 Pipeline initialized."
 
-      - name: "📥 Checkout repository"
+      # 2. SETUP
+      - name: "📦 2/5 | Setup Python & Dependencies"
         uses: actions/checkout@v4
 
-      - name: "🐍 Set up Python"
+      - name: "🐍 Setup Python Environment"
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: "📦 Install dependencies"
+      - name: "📥 Install Dependencies"
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
           echo "✅ Dependencies installed."
 
-      - name: "🔐 Validate configuration"
+      # 3. CONFIGURATION AND STARTUP
+      - name: "🔐 3/5 | Validate Configuration"
         env:
           database_url: ${{ secrets.DATABASE_URL }}
           elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
@@ -50,13 +55,13 @@ jobs:
           set -euo pipefail
           for name in database_url elastic_cloud_id elastic_API_key; do
             if [ -z "${!name:-}" ]; then
-              echo "::error::Required GitHub secret for $name is missing."
+              echo "::error::Required secret for $name is missing."
               exit 1
             fi
           done
           echo "✅ All required settings are configured."
 
-      - name: "🩺 Start FastAPI and wait for readiness"
+      - name: "🩺 Start FastAPI & Check Readiness"
         env:
           database_url: ${{ secrets.DATABASE_URL }}
           elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
@@ -66,12 +71,11 @@ jobs:
 
           nohup uvicorn app.main:app \
             --host 127.0.0.1 \
-            --port 8000 \
-            > fastapi.log 2>&1 &
+            --port 8000 > fastapi.log 2>&1 &
 
           echo $! > uvicorn.pid
-
           ready=0
+
           for i in $(seq 1 30); do
             if curl --silent --fail \
               http://127.0.0.1:8000/healthy \
@@ -91,14 +95,15 @@ jobs:
           done
 
           if [ "$ready" -ne 1 ]; then
-            echo "::error::FastAPI readiness check timed out."
+            echo "::error::FastAPI readiness timed out."
             cat fastapi.log
             exit 1
           fi
 
           echo "✅ FastAPI is ready."
 
-      - name: "📦 Execute full bulk upload"
+      # 4. FULL BULK UPLOAD
+      - name: "📤 4/5 | Execute Full Bulk Upload"
         env:
           database_url: ${{ secrets.DATABASE_URL }}
           elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
@@ -107,8 +112,8 @@ jobs:
           set -euo pipefail
 
           echo "📥 Fetching product records from MySQL..."
-          echo "📤 Uploading products to Elasticsearch..."
-          echo "📦 Configured bulk chunk size: 1000"
+          echo "📤 Sending documents to Elasticsearch..."
+          echo "📦 Bulk chunk size: 1000"
 
           CODE=$(curl --silent --show-error \
             -X POST http://127.0.0.1:8000/products/bulkupload \
@@ -121,12 +126,21 @@ jobs:
           echo
 
           if [[ ! "$CODE" =~ ^2[0-9][0-9]$ ]]; then
-            echo "::error::Bulk upload endpoint failed."
+            echo "::error::Full bulk upload failed."
             exit 1
           fi
 
-      - name: "📊 Validate bulk upload results"
+      # 5. VALIDATE AND CLEAN UP
+      - name: "📊 5/5 | Validate Results & Cleanup"
+        if: always()
         run: |
+          set -euo pipefail
+
+          if [ ! -f response.json ]; then
+            echo "::error::No API response available."
+            exit 1
+          fi
+
           python - <<'PY'
           import json
           import sys
@@ -139,21 +153,29 @@ jobs:
 
           for key in ("total_submitted", "uploaded", "failed"):
               if key not in result:
-                  sys.exit(f"Missing result field: {key}")
+                  sys.exit(f"Missing response field: {key}")
+
+          submitted = result["total_submitted"]
+          uploaded = result["uploaded"]
+          failed = result["failed"]
+
+          for name, value in (
+              ("total_submitted", submitted),
+              ("uploaded", uploaded),
+              ("failed", failed),
+          ):
+              if isinstance(value, bool) or not isinstance(value, int):
+                  sys.exit(f"Invalid count: {name}")
 
           print("\n========== FULL UPLOAD REPORT ==========")
-          print(f"Submitted: {result['total_submitted']}")
-          print(f"Uploaded:  {result['uploaded']}")
-          print(f"Failed:    {result['failed']}")
-
-          failed = result["failed"]
-          if isinstance(failed, bool) or not isinstance(failed, int):
-              sys.exit("Invalid failed count.")
+          print(f"Submitted: {submitted}")
+          print(f"Uploaded:  {uploaded}")
+          print(f"Failed:    {failed}")
 
           if failed > 0:
-              sys.exit("Some documents failed. Check indexing errors.")
+              sys.exit("Some documents failed indexing.")
 
-          print("✅ No bulk indexing failures reported.")
+          print("✅ No indexing failures reported.")
           PY
 
       - name: "🧹 Stop FastAPI"
@@ -163,7 +185,7 @@ jobs:
             kill "$(cat uvicorn.pid)" 2>/dev/null || true
           fi
 
-      - name: "📋 Show application logs on failure"
+      - name: "📋 Application Logs on Failure"
         if: failure()
         run: |
           if [ -f fastapi.log ]; then
@@ -171,8 +193,10 @@ jobs:
             cat fastapi.log
           fi
 
-      - name: "🎉 Pipeline completed"
+      - name: "🎉 Pipeline Completed"
         if: success()
         run: |
+          echo "========================================"
           echo "✅ FULL BULK UPLOAD COMPLETED"
           echo "Finished: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "========================================"
