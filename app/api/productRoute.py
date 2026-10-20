@@ -58,6 +58,16 @@ async def incremental_load(db:db_dependency,es:es_dependency):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,detail="The pipeline record dosent exist in the aiven database")
     products=db.query(Product).filter(Product.updated_at>pipeline.last_sync_time).order_by(Product.updated_at,Product.ec_product_id).all()
 
+    if len(products)==0:
+        return {
+            "success":True,
+            "message":"All data are in sync with the last update",
+            "total_submitted": 0,
+            "uploaded": 0,
+            "failed": 0,
+            "errors": 0,
+        }
+
     response=await load_data_sync(es,products)
     
     pipeline=db.query(SyncTable).filter(SyncTable.pipeline_name=="mysql_to_elasticsearch".casefold()).first()

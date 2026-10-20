@@ -30,7 +30,7 @@ async def bulk_upload_products(es:AsyncElasticsearch,products:List[Product]):
             stats_only=False,
         )
         # For debugging purposes
-        print(actions[0])
+        # print(actions[0])
 
         return {
             "total_submitted": len(actions),
