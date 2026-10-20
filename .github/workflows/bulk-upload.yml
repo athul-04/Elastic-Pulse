@@ -11,42 +11,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  bulk-upload:
-    name: "Full MySQL → Elasticsearch Upload"
+  initialize:
+    name: "01 - Initialize Pipeline"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      # 1. INITIALIZE
-      - name: "🚀 1/5 | Initialize Pipeline"
+      - name: "🚀 Initialize"
         run: |
-          echo "========================================"
-          echo "       ELASTIC PULSE PIPELINE"
-          echo "          FULL BULK UPLOAD"
-          echo "========================================"
-          echo "Mode: FULL LOAD"
+          echo "ELASTIC PULSE - FULL BULK UPLOAD"
           echo "Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "🚀 Pipeline initialized."
 
-      # 2. SETUP
-      - name: "📦 2/5 | Setup Python & Dependencies"
-        uses: actions/checkout@v4
+  setup:
+    name: "02 - Setup Python & Dependencies"
+    runs-on: ubuntu-latest
+    needs: initialize
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: "🐍 Setup Python Environment"
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: "📥 Install Dependencies"
+      - name: "📦 Validate requirements"
         run: |
+          test -f requirements.txt
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          echo "✅ Dependencies installed."
+          echo "✅ Dependencies installed successfully."
 
-      # 3. CONFIGURATION AND STARTUP
-      - name: "🔐 3/5 | Validate Configuration"
+  validate-config:
+    name: "03 - Validate Configuration"
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: "🔐 Check required secrets"
         env:
           database_url: ${{ secrets.DATABASE_URL }}
           elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
@@ -55,13 +54,32 @@ jobs:
           set -euo pipefail
           for name in database_url elastic_cloud_id elastic_API_key; do
             if [ -z "${!name:-}" ]; then
-              echo "::error::Required secret for $name is missing."
+              echo "::error::Missing required secret for $name"
               exit 1
             fi
           done
-          echo "✅ All required settings are configured."
+          echo "✅ Required configuration is present."
 
-      - name: "🩺 Start FastAPI & Check Readiness"
+  execute-sync:
+    name: "04 - Execute Full Bulk Upload"
+    runs-on: ubuntu-latest
+    needs: validate-config
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: "📦 Install dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: "🩺 Start FastAPI and run upload"
         env:
           database_url: ${{ secrets.DATABASE_URL }}
           elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
@@ -70,12 +88,11 @@ jobs:
           set -euo pipefail
 
           nohup uvicorn app.main:app \
-            --host 127.0.0.1 \
-            --port 8000 > fastapi.log 2>&1 &
-
+            --host 127.0.0.1 --port 8000 \
+            > fastapi.log 2>&1 &
           echo $! > uvicorn.pid
-          ready=0
 
+          ready=0
           for i in $(seq 1 30); do
             if curl --silent --fail \
               http://127.0.0.1:8000/healthy \
@@ -83,61 +100,75 @@ jobs:
               ready=1
               break
             fi
-
             if ! kill -0 "$(cat uvicorn.pid)" 2>/dev/null; then
-              echo "::error::FastAPI stopped during startup."
               cat fastapi.log
               exit 1
             fi
-
-            echo "⏳ Waiting for FastAPI ($i/30)..."
+            echo "Waiting for API ($i/30)..."
             sleep 2
           done
 
           if [ "$ready" -ne 1 ]; then
-            echo "::error::FastAPI readiness timed out."
             cat fastapi.log
             exit 1
           fi
 
-          echo "✅ FastAPI is ready."
-
-      # 4. FULL BULK UPLOAD
-      - name: "📤 4/5 | Execute Full Bulk Upload"
-        env:
-          database_url: ${{ secrets.DATABASE_URL }}
-          elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
-          elastic_API_key: ${{ secrets.ELASTIC_API_KEY }}
-        run: |
-          set -euo pipefail
-
-          echo "📥 Fetching product records from MySQL..."
-          echo "📤 Sending documents to Elasticsearch..."
-          echo "📦 Bulk chunk size: 1000"
-
+          echo "📤 Triggering full upload..."
           CODE=$(curl --silent --show-error \
             -X POST http://127.0.0.1:8000/products/bulkupload \
             -H "Content-Type: application/json" \
-            -o response.json \
-            -w "%{http_code}")
+            -o response.json -w "%{http_code}")
 
           echo "HTTP status: $CODE"
           cat response.json
-          echo
 
           if [[ ! "$CODE" =~ ^2[0-9][0-9]$ ]]; then
-            echo "::error::Full bulk upload failed."
+            echo "::error::Bulk upload endpoint failed."
             exit 1
           fi
 
-      # 5. VALIDATE AND CLEAN UP
-      - name: "📊 5/5 | Validate Results & Cleanup"
+      - name: "📤 Save sync result and logs"
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bulk-upload-result
+          path: |
+            response.json
+            fastapi.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: "🧹 Stop FastAPI"
+        if: always()
+        run: |
+          if [ -f uvicorn.pid ]; then
+            kill "$(cat uvicorn.pid)" 2>/dev/null || true
+          fi
+
+  validate-results:
+    name: "05 - Validate Results & Report"
+    runs-on: ubuntu-latest
+    needs: execute-sync
+    if: always()
+    steps:
+      - name: "📥 Download sync result"
+        uses: actions/download-artifact@v4
+        with:
+          name: bulk-upload-result
+          path: sync-output
+        continue-on-error: true
+
+      - name: "📊 Validate upload counts"
+        env:
+          EXECUTION_RESULT: ${{ needs.execute-sync.result }}
         run: |
           set -euo pipefail
 
-          if [ ! -f response.json ]; then
-            echo "::error::No API response available."
+          if [ "$EXECUTION_RESULT" != "success" ]; then
+            echo "::error::The upload execution job failed."
+            if [ -f sync-output/fastapi.log ]; then
+              cat sync-output/fastapi.log
+            fi
             exit 1
           fi
 
@@ -145,15 +176,19 @@ jobs:
           import json
           import sys
 
-          with open("response.json", encoding="utf-8") as f:
-              result = json.load(f)
+          path = "sync-output/response.json"
+          try:
+              with open(path, encoding="utf-8") as f:
+                  result = json.load(f)
+          except Exception as exc:
+              sys.exit(f"Cannot read API response: {exc}")
 
           if not isinstance(result, dict):
               sys.exit("Unexpected API response.")
 
           for key in ("total_submitted", "uploaded", "failed"):
               if key not in result:
-                  sys.exit(f"Missing response field: {key}")
+                  sys.exit(f"Missing result field: {key}")
 
           submitted = result["total_submitted"]
           uploaded = result["uploaded"]
@@ -167,7 +202,7 @@ jobs:
               if isinstance(value, bool) or not isinstance(value, int):
                   sys.exit(f"Invalid count: {name}")
 
-          print("\n========== FULL UPLOAD REPORT ==========")
+          print("\n========== FULL BULK UPLOAD REPORT ==========")
           print(f"Submitted: {submitted}")
           print(f"Uploaded:  {uploaded}")
           print(f"Failed:    {failed}")
@@ -178,25 +213,12 @@ jobs:
           print("✅ No indexing failures reported.")
           PY
 
-      - name: "🧹 Stop FastAPI"
-        if: always()
-        run: |
-          if [ -f uvicorn.pid ]; then
-            kill "$(cat uvicorn.pid)" 2>/dev/null || true
-          fi
-
-      - name: "📋 Application Logs on Failure"
-        if: failure()
-        run: |
-          if [ -f fastapi.log ]; then
-            echo "========== FASTAPI LOGS =========="
-            cat fastapi.log
-          fi
-
-      - name: "🎉 Pipeline Completed"
+      - name: "🎉 Pipeline completed"
         if: success()
         run: |
-          echo "========================================"
-          echo "✅ FULL BULK UPLOAD COMPLETED"
-          echo "Finished: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "========================================"
+          echo "✅ FULL BULK UPLOAD SUCCESSFUL"
+
+      - name: "❌ Pipeline failed"
+        if: failure()
+        run: |
+          echo "::error::Full bulk upload pipeline failed."
