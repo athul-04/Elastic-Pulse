@@ -1,0 +1,178 @@
+name: "🔄 Incremental Sync | Elastic Pulse"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elastic-pulse-sync
+  cancel-in-progress: false
+
+jobs:
+  incremental-sync:
+    name: "Incremental MySQL → Elasticsearch Sync"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: "🚀 Initialize pipeline"
+        run: |
+          echo "========================================"
+          echo "       ELASTIC PULSE PIPELINE"
+          echo "          INCREMENTAL SYNC"
+          echo "========================================"
+          echo "Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: "📦 Install dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          echo "✅ Dependencies installed."
+
+      - name: "🔐 Validate configuration"
+        env:
+          database_url: ${{ secrets.DATABASE_URL }}
+          elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
+          elastic_API_key: ${{ secrets.ELASTIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          for name in database_url elastic_cloud_id elastic_API_key; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Required GitHub secret for $name is missing."
+              exit 1
+            fi
+          done
+          echo "✅ All required settings are configured."
+
+      - name: "🩺 Start FastAPI and wait for readiness"
+        env:
+          database_url: ${{ secrets.DATABASE_URL }}
+          elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
+          elastic_API_key: ${{ secrets.ELASTIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          nohup uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > fastapi.log 2>&1 &
+
+          echo $! > uvicorn.pid
+
+          ready=0
+          for i in $(seq 1 30); do
+            if curl --silent --fail \
+              http://127.0.0.1:8000/healthy \
+              -o /tmp/health.json; then
+              ready=1
+              break
+            fi
+
+            if ! kill -0 "$(cat uvicorn.pid)" 2>/dev/null; then
+              echo "::error::FastAPI stopped during startup."
+              cat fastapi.log
+              exit 1
+            fi
+
+            echo "⏳ Waiting for FastAPI ($i/30)..."
+            sleep 2
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::FastAPI readiness check timed out."
+            cat fastapi.log
+            exit 1
+          fi
+
+          echo "✅ FastAPI is ready."
+
+      - name: "🔄 Execute incremental sync"
+        env:
+          database_url: ${{ secrets.DATABASE_URL }}
+          elastic_cloud_id: ${{ secrets.ELASTIC_CLOUD_ID }}
+          elastic_API_key: ${{ secrets.ELASTIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          echo "🕒 Reading the saved sync checkpoint..."
+          echo "🔍 Selecting changed MySQL records..."
+          echo "📤 Bulk-indexing changed documents..."
+
+          CODE=$(curl --silent --show-error \
+            -X POST http://127.0.0.1:8000/products/incremental_load \
+            -H "Content-Type: application/json" \
+            -o response.json \
+            -w "%{http_code}")
+
+          echo "HTTP status: $CODE"
+          cat response.json
+          echo
+
+          if [[ ! "$CODE" =~ ^2[0-9][0-9]$ ]]; then
+            echo "::error::Incremental sync endpoint failed."
+            exit 1
+          fi
+
+      - name: "📊 Validate incremental sync results"
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+
+          with open("response.json", encoding="utf-8") as f:
+              result = json.load(f)
+
+          if not isinstance(result, dict):
+              sys.exit("Unexpected API response.")
+
+          for key in ("total_submitted", "uploaded", "failed"):
+              if key not in result:
+                  sys.exit(f"Missing result field: {key}")
+
+          print("\n========== INCREMENTAL SYNC REPORT ==========")
+          print(f"Submitted: {result['total_submitted']}")
+          print(f"Uploaded:  {result['uploaded']}")
+          print(f"Failed:    {result['failed']}")
+
+          failed = result["failed"]
+          if isinstance(failed, bool) or not isinstance(failed, int):
+              sys.exit("Invalid failed count.")
+
+          if failed > 0:
+              sys.exit("Some documents failed. Check indexing errors.")
+
+          print("✅ No indexing failures reported.")
+          PY
+
+      - name: "🧹 Stop FastAPI"
+        if: always()
+        run: |
+          if [ -f uvicorn.pid ]; then
+            kill "$(cat uvicorn.pid)" 2>/dev/null || true
+          fi
+
+      - name: "📋 Show application logs on failure"
+        if: failure()
+        run: |
+          if [ -f fastapi.log ]; then
+            echo "========== FASTAPI LOGS =========="
+            cat fastapi.log
+          fi
+
+      - name: "🎉 Pipeline completed"
+        if: success()
+        run: |
+          echo "✅ INCREMENTAL SYNC COMPLETED"
+          echo "Finished: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
