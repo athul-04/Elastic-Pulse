@@ -61,7 +61,11 @@ async def incremental_load(db:db_dependency,es:es_dependency):
     if len(products)==0:
         return {
             "success":True,
-            "message":"All data are in sync with the last update"
+            "message":"All data are in sync with the last update",
+            "total_submitted": 0,
+            "uploaded": 0,
+            "failed": 0,
+            "errors": 0,
         }
 
     response=await load_data_sync(es,products)
