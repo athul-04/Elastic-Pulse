@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Text, DECIMAL
+from sqlalchemy import Column, String, Text, DECIMAL,DateTime
 from sqlalchemy.dialects.mysql import JSON
 from app.Database.database import Base
 
@@ -14,6 +14,8 @@ class Product(Base):
     ec_images = Column(JSON, nullable=True)
     ec_description = Column(Text, nullable=True)
     ec_brand = Column(String(100), nullable=True)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
 
     def __repr__(self):
         return f"<Product(id={self.ec_product_id}, name={self.ec_product_name})>"

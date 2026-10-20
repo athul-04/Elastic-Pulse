@@ -25,6 +25,7 @@ async def bulk_upload_products(es:AsyncElasticsearch,products:List[Product]):
         uploaded, errors = await async_bulk(
             es,
             actions,
+            chunk_size=1000,
             raise_on_error=False,
             stats_only=False,
         )
