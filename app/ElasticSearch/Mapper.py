@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel,Field
 from typing import Optional,List
 from decimal import Decimal
@@ -13,6 +15,8 @@ class ProductBase(BaseModel):
     ec_images: Optional[List] = None
     ec_description: Optional[str] = None
     ec_brand: Optional[str] = Field(None, max_length=100)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -28,5 +32,7 @@ def map_product_to_document(product:ProductBase):
         "ec_discounted_price":product.ec_discounted_price,
         "ec_images":product.ec_images,
         "ec_description":product.ec_description,
-        "title":product.ec_product_name
+        "title":product.ec_product_name,
+        "created_at": product.created_at,
+        "updated_at": product.updated_at,
     }

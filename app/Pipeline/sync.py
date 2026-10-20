@@ -4,5 +4,5 @@ from typing import List
 from app.Models.ProductModel import Product
 
 
-async def data_sync(es:AsyncElasticsearch,products:List[Product]):
+async def load_data_sync(es:AsyncElasticsearch,products:List[Product]):
     return await bulk_upload_products(es,products)
